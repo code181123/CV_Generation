@@ -2,9 +2,21 @@ import os
 import subprocess
 import traceback
 import yaml
-from flask import Flask, request, jsonify, send_file
+import json
+from flask import Flask, jsonify, send_file, request
 from flask_cors import CORS
 import logging
+import google.generativeai as genai
+import werkzeug
+from dotenv import load_dotenv
+import uuid
+from ruamel.yaml import YAML
+# Load environment variables
+load_dotenv()
+
+# Configure Gemini API
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+genai.configure(api_key=GEMINI_API_KEY)
 
 app = Flask(__name__)
 CORS(app)
@@ -13,7 +25,15 @@ CORS(app)
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-BASE_YAML_PATH = 'resume.yaml'
+# Define paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+INPUT_FOLDER = os.path.join(BASE_DIR, 'temp', 'input')
+OUTPUT_FOLDER = os.path.join(BASE_DIR, 'temp', 'output')
+BASE_YAML_PATH = os.path.join(BASE_DIR, 'resume.yaml')
+
+# Ensure input and output folders exist
+os.makedirs(INPUT_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 class JSONResumeConverter:
     def __init__(self, json_resume):
@@ -50,11 +70,9 @@ class JSONResumeConverter:
     def _build_sections(self, json_resume):
         sections = {}
         
-        # Summary
         if json_resume["basics"].get("summary"):
             sections["summary"] = [json_resume["basics"]["summary"]]
         
-        # Education
         if json_resume.get("education"):
             sections["education"] = [
                 {
@@ -68,7 +86,6 @@ class JSONResumeConverter:
                 for edu in json_resume["education"]
             ]
         
-        # Experience
         if json_resume.get("work"):
             sections["experience"] = [
                 {
@@ -82,7 +99,6 @@ class JSONResumeConverter:
                 for job in json_resume["work"]
             ]
         
-        # Publications
         if json_resume.get("publications"):
             sections["publications"] = [
                 {
@@ -95,7 +111,6 @@ class JSONResumeConverter:
                 for pub in json_resume["publications"]
             ]
         
-        # Projects
         if json_resume.get("projects"):
             sections["projects"] = [
                 {
@@ -106,7 +121,6 @@ class JSONResumeConverter:
                 for proj in json_resume["projects"]
             ]
         
-        # Technologies
         if json_resume.get("skills"):
             sections["technologies"] = [
                 {
@@ -116,7 +130,6 @@ class JSONResumeConverter:
                 for skill in json_resume["skills"]
             ]
         
-        # Awards
         if json_resume.get("awards"):
             sections["awards"] = [
                 {
@@ -131,114 +144,176 @@ class JSONResumeConverter:
     def convert(self):
         return yaml.dump(self.render_cv, sort_keys=False)
 
-@app.route('/generate_pdf', methods=['POST'])
-def generate_pdf():
-    if not request.is_json:
-        return jsonify({"error": "Request must be JSON"}), 400
-    
-    yaml_path = "yaml"
-    pdf_path = "pdf"
-    
+def enhance_resume_with_gemini(yaml_content):
     try:
-        json_data = request.get_json()
+        model = genai.GenerativeModel('gemini-pro')
+        
+        enhancement_prompt = f"""
+        You are a professional resume enhancement AI. Review the following resume YAML and provide suggestions to:
+        1. Improve language and descriptions
+        2. Highlight key achievements more effectively
+        3. Use action-oriented and impactful language
+        4. Ensure clarity and conciseness
+        5. Align descriptions with industry best practices
+
+        Original Resume YAML:
+        {yaml_content}
+
+        Please return the enhanced YAML, maintaining the exact same structure. Focus on making the resume more compelling and professional.
+        """
+        
+        response = model.generate_content(enhancement_prompt)
+        
+        enhanced_yaml = response.text.strip()
+        
+        try:
+            yaml.safe_load(enhanced_yaml)
+        except yaml.YAMLError:
+            logger.warning("Gemini-generated YAML is invalid. Falling back to original.")
+            return yaml_content
+        
+        return enhanced_yaml
+    
+    except Exception as e:
+        logger.error(f"Gemini enhancement failed: {e}")
+        return yaml_content
+    
+def replace_bullet_in_yaml(file_path, new_bullet="•"):
+    """
+    Replaces the `design.highlights.bullet` value in a YAML file with a new bullet character.
+    
+    Args:
+        file_path (str): Path to the YAML file.
+        new_bullet (str): The new bullet character to use (default is "•").
+    
+    Returns:
+        bool: True if the replacement was successful, False otherwise.
+    """
+    try:
+        yaml = YAML()
+        with open(file_path, 'r', encoding='utf-8') as file:
+            data = yaml.load(file)
+
+        # Navigate to the `design.highlights.bullet` field
+        if 'design' in data and 'highlights' in data['design']:
+            data['design']['highlights']['bullet'] = new_bullet
+        else:
+            print("The specified path `design.highlights.bullet` does not exist in the YAML file.")
+            return False
+
+        # Save the modified YAML back to the file
+        with open(file_path, 'w', encoding='utf-8') as file:
+            yaml.dump(data, file)
+        
+        print(f"`design.highlights.bullet` successfully updated to '{new_bullet}'.")
+        return True
+    except Exception as e:
+        print(f"An error occurred while processing the YAML file: {e}")
+        return False
+    
+def generate_resume_pdf(json_file_path):
+    try:
+        # Read JSON file
+        with open(json_file_path, 'r') as f:
+            json_data = json.load(f)
         
         # Convert JSON to YAML
         converter = JSONResumeConverter(json_data)
         new_cv_yaml = converter.convert()
         
-        # Create temporary files with absolute paths
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        yaml_path = os.path.join(script_dir, 'temp_resume.yaml')
-        pdf_path = os.path.abspath(os.path.join(script_dir, 'resume.pdf'))
+        # Enhance YAML with Gemini AI
+        enhanced_cv_yaml = enhance_resume_with_gemini(new_cv_yaml)
         
-        # Comprehensive error checking for rendercv
-        try:
-            # Check if rendercv is installed
-            rendercv_version = subprocess.run(
-                ['which', 'rendercv'], 
-                capture_output=True, 
-                text=True, 
-                check=True
-            )
-            logger.info(f"RenderCV path: {rendercv_version.stdout.strip()}")
-        except subprocess.CalledProcessError:
-            return jsonify({
-                "error": "RenderCV is not installed",
-                "details": "Please install RenderCV using 'pipx install rendercv'"
-            }), 500
+        # Generate output filenames based on input filename
+        input_filename = os.path.splitext(os.path.basename(json_file_path))[0]
+        pdf_path = os.path.join(OUTPUT_FOLDER, f'{input_filename}_resume.pdf')
+        yaml_path = os.path.join(OUTPUT_FOLDER, f'{input_filename}_resume.yaml')
         
         # Load base YAML design
         with open(BASE_YAML_PATH, 'r') as f:
             base_yaml = yaml.safe_load(f)
         
-        # Update CV section
-        new_cv_data = yaml.safe_load(new_cv_yaml)
+        # Update CV section with enhanced YAML
+        new_cv_data = yaml.safe_load(enhanced_cv_yaml)
         base_yaml['cv'] = new_cv_data['cv']
         
         # Write merged YAML
         with open(yaml_path, 'w') as f:
             yaml.dump(base_yaml, f, default_flow_style=False)
-        
-        # Comprehensive logging of YAML contents
-        logger.debug(f"Generated YAML contents:\n{open(yaml_path, 'r').read()}")
-        
-        # Run rendercv with comprehensive error handling
-        try:
-            result = subprocess.run(
-                ['rendercv', 'render', yaml_path, '-o', pdf_path],
-                capture_output=True,
-                text=True,
-                check=True,
-                env=os.environ.copy()  # Ensure full environment is passed
-            )
-            logger.info("RenderCV stdout: %s", result.stdout)
-            logger.info("RenderCV stderr: %s", result.stderr)
-        except subprocess.CalledProcessError as e:
-            logger.error("RenderCV error: %s", e)
-            logger.error("Stdout: %s", e.stdout)
-            logger.error("Stderr: %s", e.stderr)
-            return jsonify({
-                "error": "PDF generation failed",
-                "stdout": e.stdout,
-                "stderr": e.stderr
-            }), 500
-        
-        # Verify PDF generation
-        if not os.path.isfile(pdf_path):
-            logger.error("PDF file was not created")
-            return jsonify({
-                "error": "PDF file was not created",
-                "script_dir": script_dir,
-                "script_dir_contents": os.listdir(script_dir),
-                "yaml_path": yaml_path
-            }), 500
-        
-        response = send_file(
-            pdf_path,
-            as_attachment=True,
-            download_name='resume.pdf',
-            mimetype='application/pdf'
+        print(yaml_path)
+        replace_bullet_in_yaml(yaml_path)
+        # Run rendercv directly to output in the output folder
+        result = subprocess.run(
+            ['rendercv', 'render', yaml_path, '-o', pdf_path],
+            capture_output=True,
+            text=True,
+            check=True,
+            env=os.environ.copy(),
+            cwd=OUTPUT_FOLDER
         )
-        return response
+        
+        logger.info(f"PDF generated successfully at {pdf_path}")
+        return pdf_path
     
     except Exception as e:
-        logger.error("Processing failed: %s", str(e))
-        logger.error("Traceback: %s", traceback.format_exc())
-        return jsonify({
-            "error": "Processing failed",
-            "details": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
+        logger.error(f"PDF generation failed: {e}")
+        logger.error(traceback.format_exc())
+        raise
+
+def process_json_files():
+    """Process all JSON files in the input folder"""
+    processed_count = 0
+    for filename in os.listdir(INPUT_FOLDER):
+        if filename.endswith('.json'):
+            try:
+                input_path = os.path.join(INPUT_FOLDER, filename)
+                output_pdf = generate_resume_pdf(input_path)
+                processed_count += 1
+                logger.info(f"Processed {filename}, PDF saved at {output_pdf}")
+            except Exception as e:
+                logger.error(f"Failed to process {filename}: {e}")
     
-    finally:
-        # Clean up temporary files
-        try:
-            if yaml_path and os.path.exists(yaml_path):
-                os.unlink(yaml_path)
-            if pdf_path and os.path.exists(pdf_path):
-                os.unlink(pdf_path)
-        except Exception as cleanup_error:
-            logger.error("Cleanup error: %s", str(cleanup_error))
+    logger.info(f"Total files processed: {processed_count}")
+
+@app.route('/upload', methods=['POST'])
+def upload_json():
+    """
+    Endpoint to upload JSON resume via request body
+    """
+    # Check if request body is JSON
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+    
+    try:
+        # Get JSON data from request
+        json_data = request.get_json()
+        
+        # Validate JSON structure (basic check)
+        if not json_data or 'basics' not in json_data:
+            return jsonify({"error": "Invalid JSON resume format"}), 400
+        
+        # Generate unique filename
+        filename = f"{uuid.uuid4()}_resume.json"
+        file_path = os.path.join(INPUT_FOLDER, filename)
+        
+        # Save JSON to file
+        with open(file_path, 'w') as f:
+            json.dump(json_data, f, indent=2)
+        
+        logger.info(f"JSON file saved: {file_path}")
+        
+        # Generate PDF
+        pdf_path = generate_resume_pdf(file_path)
+        
+        return jsonify({
+            "message": "Resume processed successfully",
+            "pdf_path": pdf_path,
+            "json_filename": filename
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Error processing JSON: {e}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=5000)
